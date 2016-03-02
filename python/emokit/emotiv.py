@@ -2,8 +2,8 @@ import os
 import platform
 system_platform = platform.system()
 if system_platform == "Windows":
-        import socket  # Needed to prevent gevent crashing on Windows. (surfly / gevent issue #459)
-        import pywinusb.hid as hid
+    import socket  # Needed to prevent gevent crashing on Windows. (surfly / gevent issue #459)
+    # import pywinusb.hid as hid
 else:
     if system_platform == "Darwin":
         import hid
@@ -206,11 +206,15 @@ def get_level(data, bits):
     return level
 
 
-def get_linux_setup():
+def get_linux_setup(device=-1, verbose=False):
     """
-    Returns hidraw device path and headset serial number.
+    Returns hidraw device path and headset serial number. Note that Emotiv Epoc often creates two hidraw devices,
+    in which case the second device is usually the one that actually gets data.
     """
+    eeg_manufacturer = "Emotiv Systems"
     raw_inputs = []
+    hidraws = []
+    serials = []
     for filename in os.listdir("/sys/class/hidraw"):
         real_path = check_output(["realpath", "/sys/class/hidraw/" + filename])
         split_path = real_path.split('/')
@@ -222,26 +226,23 @@ def get_linux_setup():
             path = path + split_path[i] + "/"
             i += 1
         raw_inputs.append([path, filename])
-    for input in raw_inputs:
-        try:
-            with open(input[0] + "/manufacturer", 'r') as f:
-                manufacturer = f.readline()
+    for rinput in raw_inputs:
+        with open(rinput[0] + "/manufacturer", 'r') as f:
+            manufacturer = f.readline()
+            f.close()
+        if eeg_manufacturer in manufacturer:
+            with open(rinput[0] + "/serial", 'r') as f:
+                serial = f.readline().strip()
                 f.close()
-            if "Emotiv Systems" in manufacturer:
-                with open(input[0] + "/serial", 'r') as f:
-                    serial = f.readline().strip()
-                    f.close()
-                print "Serial: " + serial + " Device: " + input[1]
-                # Great we found it. But we need to use the second one...
-                hidraw = input[1]
-                hidraw_id = int(hidraw[-1])
-                # The dev headset might use the first device, or maybe if more than one are connected they might.
-                hidraw_id += 1
-                hidraw = "hidraw" + hidraw_id.__str__()
-                print "Serial: " + serial + " Device: " + hidraw + " (Active)"
-                return [serial, hidraw, ]
-        except IOError as e:
-            print "Couldn't open file: %s" % e
+            if verbose:
+                print "Detected " + "Serial: " + serial + " Device: " + rinput[1]
+            hidraws.append(rinput[1])
+            serials.append(serial)
+    if not len(hidraws):
+        raise IOError("Could not find a USB device with manufacturer: %s" % eeg_manufacturer)
+    if verbose:
+        print "Using " + "Serial: " + serials[device] + " Device: " + hidraws[device]
+    return serials[device], hidraws[device]
 
 
 def hid_enumerate():
@@ -256,7 +257,7 @@ def hid_enumerate():
         for key in keys:
             print "%s : %s" % (key, d[key])
             print ""
-  
+
 
 def is_old_model(serial_number):
         if "GM" in serial_number[-2:]:
@@ -302,9 +303,9 @@ class EmotivPacket(object):
         Optionally will return the value.
         """
         if self.old_model:
-            current_contact_quality = get_level(self.raw_data, quality_bits) / 540
+            current_contact_quality = get_level(self.raw_data, quality_bits) / 540.0
         else:
-            current_contact_quality = get_level(self.raw_data, quality_bits) / 1024
+            current_contact_quality = get_level(self.raw_data, quality_bits) / 1024.0
         sensor = ord(self.raw_data[0])
         if sensor == 0 or sensor == 64:
             sensors['F3']['quality'] = current_contact_quality
@@ -358,9 +359,11 @@ class Emotiv(object):
     """
     Receives, decrypts and stores packets received from Emotiv Headsets.
     """
-    def __init__(self, display_output=True, serial_number="", is_research=False):
+    def __init__(self, display_output=True, verbose=False, serial_number="", eeg_usb_device=-1, is_research=False):
         """
-        Sets up initial values.
+        Sets up initial values. Serial number is required for OS X only. Emotiv Epoc sometimes creates two usb devices,
+        in which case the second device is usually the one that actually gets data; *eeg_usb_device* controls which
+        Emotiv device is polled on linux.
         """
         self.running = True
         self.packets = Queue()
@@ -368,6 +371,8 @@ class Emotiv(object):
         self.packets_processed = 0
         self.battery = 0
         self.display_output = display_output
+        self.eeg_usb_device = eeg_usb_device
+        self.verbose = verbose
         self.is_research = is_research
         self.sensors = {
             'F3': {'value': 0, 'quality': 0},
@@ -395,7 +400,8 @@ class Emotiv(object):
         """
         Runs setup function depending on platform.
         """
-        print system_platform + " detected."
+        if self.verbose:
+            print system_platform + " detected."
         if system_platform == "Windows":
             self.setup_windows()
         elif system_platform == "Linux":
@@ -467,12 +473,12 @@ class Emotiv(object):
             _os_decryption = True
             hidraw = open("/dev/eeg/raw")
         else:
-            serial, hidraw_filename = get_linux_setup()
+            serial, hidraw_filename = get_linux_setup(device=self.eeg_usb_device, verbose=self.verbose)
             self.serial_number = serial
             if os.path.exists("/dev/" + hidraw_filename):
                 hidraw = open("/dev/" + hidraw_filename)
             else:
-                hidraw = open("/dev/hidraw4")
+                raise IOError("Could not open HID associated with EEG device: %s" % hidraw_filename)
             crypto = gevent.spawn(self.setup_crypto, self.serial_number)
         console_updater = gevent.spawn(self.update_console)
         while self.running:
@@ -512,11 +518,9 @@ class Emotiv(object):
         if not hidraw:
             hidraw = hid.device(0xed02, 0x1234)
         if not hidraw:
-            print "Device not found. Uncomment the code in setup_darwin and modify hid.device(vendor_id, product_id)"
-            raise ValueError
+            raise ValueError("Device not found. Uncomment the code in setup_darwin and modify hid.device(vendor_id, product_id)")
         if self.serial_number == "":
-            print "Serial number needs to be specified manually in __init__()."
-            raise ValueError
+            raise ValueError("Serial number needs to be specified manually in __init__().")
         crypto = gevent.spawn(self.setup_crypto, self.serial_number)
         console_updater = gevent.spawn(self.update_console)
         zero = 0
@@ -551,7 +555,8 @@ class Emotiv(object):
         """
         if is_old_model(sn):
             self.old_model = True
-        print self.old_model
+        if self.verbose:
+            print "Old model detected" if self.old_model else "Newish model detected"
         k = ['\0'] * 16
         k[0] = sn[-1]
         k[1] = '\0'
@@ -583,8 +588,10 @@ class Emotiv(object):
         key = ''.join(k)
         iv = Random.new().read(AES.block_size)
         cipher = AES.new(key, AES.MODE_ECB, iv)
-        for i in k:
-            print "0x%.02x " % (ord(i))
+        if self.verbose:
+            print "Decryption Info:"
+            for i in k:
+                print "0x%.02x " % (ord(i))
         while self.running:
             while not tasks.empty():
                 task = tasks.get()
@@ -623,7 +630,7 @@ class Emotiv(object):
                 else:
                     os.system('clear')
                 print "Packets Received: %s Packets Processed: %s" % (self.packets_received, self.packets_processed)
-                print('\n'.join("%s Reading: %s Quality: %s" %
+                print('\n'.join("%s Reading: %d Quality: %.3f" %
                                 (k[1], self.sensors[k[1]]['value'],
                                  self.sensors[k[1]]['quality']) for k in enumerate(self.sensors)))
                 print "Battery: %i" % g_battery
