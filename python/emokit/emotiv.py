@@ -227,17 +227,20 @@ def get_linux_setup(device=-1, verbose=False):
             i += 1
         raw_inputs.append([path, filename])
     for rinput in raw_inputs:
-        with open(rinput[0] + "/manufacturer", 'r') as f:
-            manufacturer = f.readline()
-            f.close()
-        if eeg_manufacturer in manufacturer:
-            with open(rinput[0] + "/serial", 'r') as f:
-                serial = f.readline().strip()
+        try:
+            with open(rinput[0] + "/manufacturer", 'r') as f:
+                manufacturer = f.readline()
                 f.close()
-            if verbose:
-                print "Detected " + "Serial: " + serial + " Device: " + rinput[1]
-            hidraws.append(rinput[1])
-            serials.append(serial)
+            if eeg_manufacturer in manufacturer:
+                with open(rinput[0] + "/serial", 'r') as f:
+                    serial = f.readline().strip()
+                    f.close()
+                if verbose:
+                    print "Detected " + "Serial: " + serial + " Device: " + rinput[1]
+                hidraws.append(rinput[1])
+                serials.append(serial)
+        except:
+            pass
     if not len(hidraws):
         raise IOError("Could not find a USB device with manufacturer: %s" % eeg_manufacturer)
     if verbose:
